@@ -71,7 +71,7 @@ if broken:
         for c in broken:
             st.warning(f"**{c['name']}**: {c['detail']}")
 
-st.info("This build now works in a fully demo-safe mode even without live Gemini credentials or a live webcmd browser session, while still showing the full procurement workflow.")
+#st.info("This build now works in a fully demo-safe mode even without live Gemini credentials or a live webcmd browser session, while still showing the full procurement workflow.")
 
 # ---------------------------------------------------------------------------
 # Sidebar: Agent Spending Mandate (Section 5) — pulled straight from
