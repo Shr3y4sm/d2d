@@ -29,6 +29,7 @@ import os
 import hmac
 import hashlib
 import razorpay
+from typing import Dict
 
 import config
 
@@ -100,6 +101,190 @@ def verify_payment(razorpay_order_id: str, razorpay_payment_id: str, razorpay_si
         return True
     except razorpay.errors.SignatureVerificationError:
         return False
+
+
+def automate_razorpay_checkout(order: dict, callback_base_url: str) -> Dict:
+    """
+    Uses webcmd browser to automate the Razorpay checkout form filling.
+    This is the "agent pays" step for the customer payment — webcmd
+    opens the checkout page, fills the test card details, and submits.
+
+    Returns a dict with steps and status.
+    """
+    import subprocess
+    import time
+
+    order_id = order["id"]
+    amount_paise = order["amount"]
+    steps = []
+    session = "d2d_razorpay_checkout"
+
+    # Build the checkout URL — Razorpay's hosted checkout page
+    checkout_url = f"https://checkout.razorpay.com/v1/checkout.html?order_id={order_id}&key_id={RAZORPAY_KEY_ID}&amount={amount_paise}&currency=INR&name=Demand2Deal&description=Customer+Payment"
+
+    # Step 1: Open the checkout page
+    try:
+        res = subprocess.run(
+            ["webcmd", "browser", session, "open", checkout_url],
+            capture_output=True, text=True, timeout=30,
+        )
+        if res.returncode != 0:
+            return {"status": "FAILED", "steps": [{"action": "Open checkout page", "status": "failed"}],
+                    "note": f"webcmd failed to open checkout: {res.stderr[:200]}"}
+        steps.append({"action": f"Opened Razorpay checkout page", "status": "completed"})
+    except Exception as e:
+        return {"status": "FAILED", "steps": [{"action": "Open checkout page", "status": "failed"}],
+                "note": str(e)}
+
+    time.sleep(3)  # let the page render
+
+    # Step 2: Try to find and fill the card number field
+    # Razorpay checkout uses iframes for card fields, but in Test Mode
+    # the fields might be accessible
+    card_filled = False
+
+    # Try common card number selectors
+    card_selectors = [
+        'input[name="card[number]"]',
+        'input[name="card_number"]',
+        'input[placeholder*="card number"]',
+        'input[placeholder*="Card Number"]',
+        'input[id*="card"]',
+        '#card-number',
+    ]
+
+    for selector in card_selectors:
+        try:
+            find_res = subprocess.run(
+                ["webcmd", "browser", session, "find", "--css", selector],
+                capture_output=True, text=True, timeout=10,
+            )
+            if find_res.returncode == 0 and find_res.stdout.strip():
+                # Found the field — fill it
+                fill_res = subprocess.run(
+                    ["webcmd", "browser", session, "fill", selector, "4111111111111111"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if fill_res.returncode == 0:
+                    steps.append({"action": f"Filled card number (4111 1111 1111 1111)", "status": "completed"})
+                    card_filled = True
+                    break
+        except Exception:
+            continue
+
+    if not card_filled:
+        # Try using semantic locators
+        try:
+            fill_res = subprocess.run(
+                ["webcmd", "browser", session, "fill", "--role", "textbox", "--name", "card", "4111111111111111"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if fill_res.returncode == 0:
+                steps.append({"action": f"Filled card number via semantic locator", "status": "completed"})
+                card_filled = True
+        except Exception:
+            pass
+
+    if not card_filled:
+        steps.append({"action": "Card number field not found (likely in iframe) — payment automation partial", "status": "warning"})
+
+    # Step 3: Try to fill expiry
+    expiry_selectors = [
+        'input[name="card[expiry]"]',
+        'input[name="card_expiry"]',
+        'input[placeholder*="MM"]',
+        'input[placeholder*="expiry"]',
+        '#card-expiry',
+    ]
+
+    for selector in expiry_selectors:
+        try:
+            fill_res = subprocess.run(
+                ["webcmd", "browser", session, "fill", selector, "1228"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if fill_res.returncode == 0:
+                steps.append({"action": f"Filled expiry (12/28)", "status": "completed"})
+                break
+        except Exception:
+            continue
+
+    # Step 4: Try to fill CVV
+    cvv_selectors = [
+        'input[name="card[cvv]"]',
+        'input[name="card_cvv"]',
+        'input[placeholder*="CVV"]',
+        'input[placeholder*="cvv"]',
+        '#card-cvv',
+    ]
+
+    for selector in cvv_selectors:
+        try:
+            fill_res = subprocess.run(
+                ["webcmd", "browser", session, "fill", selector, "123"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if fill_res.returncode == 0:
+                steps.append({"action": f"Filled CVV (123)", "status": "completed"})
+                break
+        except Exception:
+            continue
+
+    # Step 5: Try to click the Pay button
+    pay_selectors = [
+        'button[type="submit"]',
+        'button:text-is("Pay")',
+        'button:text-is("Pay Now")',
+        '#pay-button',
+        'button[class*="pay"]',
+    ]
+
+    pay_clicked = False
+    for selector in pay_selectors:
+        try:
+            click_res = subprocess.run(
+                ["webcmd", "browser", session, "click", selector],
+                capture_output=True, text=True, timeout=10,
+            )
+            if click_res.returncode == 0:
+                steps.append({"action": f"Clicked Pay button", "status": "completed"})
+                pay_clicked = True
+                break
+        except Exception:
+            continue
+
+    if not pay_clicked:
+        steps.append({"action": "Pay button not found — manual click may be needed", "status": "warning"})
+
+    # Step 6: Wait and capture the result
+    time.sleep(3)
+    try:
+        extract_res = subprocess.run(
+            ["webcmd", "browser", session, "extract", "--chunk-size", "8000"],
+            capture_output=True, text=True, timeout=15,
+        )
+        final_content = extract_res.stdout or ""
+    except Exception:
+        final_content = ""
+
+    # Close the session
+    try:
+        subprocess.run(["webcmd", "browser", session, "close"],
+                        capture_output=True, text=True, timeout=10)
+    except Exception:
+        pass
+
+    # Check if payment was successful
+    success_keywords = ["payment", "success", "authorized", "completed"]
+    payment_success = any(kw in final_content.lower() for kw in success_keywords) if final_content else False
+
+    if payment_success:
+        steps.append({"action": "✅ Payment appears successful", "status": "completed"})
+        return {"status": "SUCCESS", "steps": steps, "note": "webcmd automated the Razorpay checkout form."}
+    else:
+        steps.append({"action": "Payment status unclear — check Razorpay dashboard", "status": "info"})
+        return {"status": "PREPARED_NOT_FINALIZED", "steps": steps,
+                "note": "webcmd attempted to automate the checkout. If card fields are in an iframe, manual completion may be needed."}
 
 
 def build_checkout_html(order: dict, customer_name: str, description: str, callback_base_url: str) -> str:

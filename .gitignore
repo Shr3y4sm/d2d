@@ -39,3 +39,6 @@ Thumbs.db
 
 # Agent/Assistant
 .agents
+
+audit_log.json
+streamlit.log

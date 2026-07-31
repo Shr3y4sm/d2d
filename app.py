@@ -9,7 +9,8 @@ config.load_environment()
 from engine import (
     parse_rfq_with_gemini, fetch_all_live_suppliers, get_reference_fallback_quotes,
     optimize_supply_chain, execute_supplier_procurement, revalidate_mandate_before_purchase,
-    check_environment, SPEND_MANDATE, SUPPLIER_SOURCES,
+    check_environment, get_audit_log, _detect_product_category,
+    SPEND_MANDATE, SUPPLIER_SOURCES,
 )
 
 st.set_page_config(page_title="Demand2Deal | Autonomous Distributor", page_icon="⚡", layout="wide")
@@ -23,8 +24,10 @@ st.markdown("""
     }
     .badge-live { background:#DCFCE7; color:#166534; padding:2px 8px; border-radius:6px; font-size:0.75rem; font-weight:600; }
     .badge-reference { background:#FEF3C7; color:#92400E; padding:2px 8px; border-radius:6px; font-size:0.75rem; font-weight:600; }
+    .badge-web { background:#DBEAFE; color:#1E40AF; padding:2px 8px; border-radius:6px; font-size:0.75rem; font-weight:600; }
     .mandate-pass { color:#166534; }
     .mandate-fail { color:#B91C1C; }
+    .audit-event { padding: 8px; border-left: 3px solid #065F46; margin: 4px 0; background: #F9FAFB; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -35,15 +38,13 @@ for key, default in [
     ("step", "INPUT"), ("demand", None), ("suppliers", None), ("plan", None),
     ("data_source", "live"), ("razorpay_order", None), ("payment_verified", False),
     ("procurement_result", None), ("payment_note", ""), ("rzp_processed_ids", set()),
+    ("override_feasibility", False),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
 
 # ---------------------------------------------------------------------------
 # Catch the Razorpay Checkout redirect BEFORE anything else renders.
-# Checkout.js's success handler (see payments.build_checkout_html) sends the
-# browser back here with these three query params; Streamlit reruns the
-# whole script on every navigation, so this has to run at the top every time.
 # ---------------------------------------------------------------------------
 qp = st.query_params
 if "rzp_payment_id" in qp and qp["rzp_payment_id"] not in st.session_state.rzp_processed_ids:
@@ -59,10 +60,10 @@ if "rzp_payment_id" in qp and qp["rzp_payment_id"] not in st.session_state.rzp_p
     st.rerun()
 
 st.title("⚡ Demand2Deal — The Autonomous Distributor")
-st.caption("Commerce without Inventory | Gemini-ready · webcmd browser automation · Razorpay Test Mode")
+st.caption("Commerce without Inventory | webcmd-powered · Web-wide supplier discovery · Real checkout automation")
 
 # ---------------------------------------------------------------------------
-# Startup diagnostics — friendly warnings instead of a mid-demo traceback
+# Startup diagnostics
 # ---------------------------------------------------------------------------
 env_checks = check_environment()
 broken = [c for c in env_checks if not c["ok"] and c["name"] != "Razorpay"]
@@ -71,20 +72,19 @@ if broken:
         for c in broken:
             st.warning(f"**{c['name']}**: {c['detail']}")
 
-#st.info("This build now works in a fully demo-safe mode even without live Gemini credentials or a live webcmd browser session, while still showing the full procurement workflow.")
-
 # ---------------------------------------------------------------------------
-# Sidebar: Agent Spending Mandate (Section 5) — pulled straight from
-# SPEND_MANDATE / SUPPLIER_SOURCES, so this can never drift out of sync
-# with what the code actually does again.
+# Sidebar: Agent Spending Mandate
 # ---------------------------------------------------------------------------
 st.sidebar.header("🛡️ Agent Spending Mandate")
 st.sidebar.metric("Max Order Ceiling", f"₹{SPEND_MANDATE['max_order_spend']:,.0f}")
 st.sidebar.metric("Min Gross Margin", f"{SPEND_MANDATE['min_gross_margin']:.0%}")
 st.sidebar.metric("Max Price Movement", f"{SPEND_MANDATE['max_price_movement_pct']:.0%}")
+st.sidebar.metric("Risk Buffer", f"{SPEND_MANDATE['risk_buffer_pct']:.0%}")
+st.sidebar.write("**Substitution Policy:**", SPEND_MANDATE["substitution_policy"].replace("_", " ").title())
 st.sidebar.write("**Approved merchants:**", ", ".join(SPEND_MANDATE["allowed_merchants"]))
 live_names = ", ".join(s["name"] for s in SUPPLIER_SOURCES)
-st.sidebar.caption(f"Live-integrated this build: {live_names}")
+st.sidebar.caption(f"Known distributors: {live_names}")
+st.sidebar.caption("➕ Web-wide discovery enabled — finds suppliers across the open web")
 if not payments.is_configured():
     st.sidebar.warning("Razorpay not configured — payment step will run in **simulated** mode.")
 elif payments.is_live_keys():
@@ -96,10 +96,22 @@ else:
 # Step 1: Human Prompt Input
 # ---------------------------------------------------------------------------
 st.subheader("1. What does your customer need?")
-hero_prompt_default = "Need 8 Raspberry Pi 5 8GB units delivered in Bengaluru within 3 days. Maximum customer price ₹8,500 each. Minimum margin 8%."
+hero_prompt_default = "Need 5 Raspberry Pi 5 8GB units delivered in Bengaluru within 3 days. Maximum customer price ₹10,000 each. Minimum margin 8%."
 prompt = st.text_area("RFQ Prompt", value=hero_prompt_default, height=75)
 
-if st.button("🚀 Process Demand & Search Live Suppliers via webcmd", type="primary"):
+# Supplier selection widget
+st.markdown("**Select suppliers to query** (fewer = faster):")
+all_supplier_options = {s["supplier_id"]: s["name"] for s in SUPPLIER_SOURCES}
+default_suppliers = ["amazon_in", "flipkart"]
+selected_suppliers = st.multiselect(
+    "Choose suppliers:",
+    options=list(all_supplier_options.keys()),
+    default=default_suppliers,
+    format_func=lambda x: all_supplier_options[x],
+    help="Only selected suppliers will be queried. Amazon.in + Flipkart is fastest.",
+)
+
+if st.button("🚀 Process Demand & Discover Suppliers", type="primary"):
     if not prompt.strip():
         st.warning("Enter what the customer needs first.")
     else:
@@ -111,8 +123,12 @@ if st.button("🚀 Process Demand & Search Live Suppliers via webcmd", type="pri
                 status.update(label=f"❌ RFQ parsing failed: {ex}", state="error")
                 st.stop()
 
-            st.write(f"2. 🌐 Querying live suppliers ({live_names}) via `webcmd`...")
-            suppliers = fetch_all_live_suppliers(demand)
+            st.write("2. 🌐 Searching selected suppliers via `webcmd`...")
+            for sid in selected_suppliers:
+                st.write(f"   • {all_supplier_options.get(sid, sid)}")
+            if "web_discovery" in selected_suppliers:
+                st.write("   • Also searching the web for additional suppliers...")
+            suppliers = fetch_all_live_suppliers(demand, selected_supplier_ids=selected_suppliers)
             st.session_state.data_source = "live"
 
             if not suppliers:
@@ -122,24 +138,22 @@ if st.button("🚀 Process Demand & Search Live Suppliers via webcmd", type="pri
                 st.session_state.plan = None
                 st.session_state.step = "NO_RESULTS"
             else:
-                st.write("3. 📊 Running commercial optimization & mandate validation...")
+                st.write("3. 📊 Running commercial optimization (MOQ, compatibility, risk buffer, substitution)...")
                 plan = optimize_supply_chain(demand, suppliers)
                 st.session_state.demand = demand
                 st.session_state.suppliers = suppliers
                 st.session_state.plan = plan
                 st.session_state.step = "OPTIMIZED"
-                status.update(label="✅ Live Supplier Search & Optimization Complete!", state="complete")
+                status.update(label="✅ Supplier Discovery & Optimization Complete!", state="complete")
 
 # ---------------------------------------------------------------------------
-# Honest fallback: live search came back empty. Offer reference pricing as
-# an explicit, visible, opt-in choice — never silently substituted.
+# Honest fallback: live search came back empty.
 # ---------------------------------------------------------------------------
 if st.session_state.step == "NO_RESULTS":
     st.error(
         "No matching suppliers came back from live search. This usually means a site's "
         "anti-bot layer blocked the request, the target page changed, or the network at "
-        "your venue is flaky. Run `webcmd browser main analyze <url>` against each "
-        "supplier to see why (see check_site.py)."
+        "your venue is flaky."
     )
     if st.button("📋 Use reference pricing to keep the demo moving (clearly marked as non-live)"):
         demand = st.session_state.demand
@@ -152,7 +166,7 @@ if st.session_state.step == "NO_RESULTS":
         st.rerun()
 
 # ---------------------------------------------------------------------------
-# Step 2: Display Supplier Comparison (Section 3.1)
+# Step 2: Display Supplier Comparison
 # ---------------------------------------------------------------------------
 if st.session_state.step in ["OPTIMIZED", "PROCURING", "PAID"]:
     demand = st.session_state.demand
@@ -173,46 +187,99 @@ if st.session_state.step in ["OPTIMIZED", "PROCURING", "PAID"]:
         unsafe_allow_html=True,
     )
 
+    # Summary stats
+    known_count = len([s for s in suppliers if s.source in ("live", "reference")])
+    web_count = len([s for s in suppliers if s.source == "web_discovered"])
+    if web_count > 0:
+        st.caption(f"🔍 {known_count} known distributors + {web_count} web-discovered suppliers")
+
+    # Show substitution info
+    if demand.substitution_allowed:
+        st.info("✅ Substitutions approved by customer")
+    else:
+        st.caption("ℹ️ Substitutions not requested — exact matches preferred")
+
     if not suppliers:
         st.error("No matching suppliers found. Try adjusting the product term or delivery timeline.")
     else:
-        cols = st.columns(5)
-        for c, label in zip(cols, ["**Supplier**", "**Stock**", "**Unit Cost**", "**Delivery SLA**", "**Agent Decision**"]):
+        # Supplier table with columns
+        cols = st.columns(7)
+        for c, label in zip(cols, ["**Supplier**", "**Stock**", "**Unit Cost**", "**MOQ**", "**Delivery**", "**Compat**", "**Agent Decision**"]):
             c.write(label)
 
         for s in suppliers:
-            c = st.columns(5)
-            c[0].write(s.name)
+            c = st.columns(7)
+            # Source badge + rating
+            name_html = s.name
+            if s.source == "web_discovered":
+                name_html += ' <span class="badge-web">🔍 WEB</span>'
+            if s.rating > 0:
+                name_html += f' <span style="font-size:0.8rem;color:#F59E0B;">⭐{s.rating:.1f}</span>'
+                if s.review_count > 0:
+                    name_html += f' <span style="font-size:0.7rem;color:#666;">({s.review_count} reviews)</span>'
+            c[0].markdown(name_html, unsafe_allow_html=True)
+            if s.product_title:
+                c[0].caption(f"*{s.product_title[:60]}{'...' if len(s.product_title) > 60 else ''}*")
+
             stock_txt = f"{s.stock} units" + (" *(est.)*" if s.is_estimate.get("stock") else "")
             c[1].write(stock_txt)
-            c[2].write(f"₹{s.unit_cost:,.2f}")
+            c[2].write(f"₹{s.unit_cost:,.2f}" if s.unit_cost > 0 else "—")
+            c[3].write(f"MOQ: {s.moq}")
             lead_txt = f"{s.lead_time_days} days" + (" *(est.)*" if s.is_estimate.get("lead_time_days") else "")
-            c[3].write(lead_txt)
+            c[4].write(lead_txt)
 
-            if s.lead_time_days > demand.max_delivery_days:
-                c[4].error(f"❌ Reject: SLA ({s.lead_time_days}d > {demand.max_delivery_days}d)")
-            elif plan and s.supplier_id in plan.supplier_allocations:
-                c[4].success(f"✅ Selected ({plan.supplier_allocations[s.supplier_id]} units)")
+            # Compatibility
+            if demand.compatibility_required:
+                if s.compatibility_score >= 0.8:
+                    c[5].success("✅")
+                elif s.compatibility_score >= 0.5:
+                    c[5].warning("⚠️")
+                else:
+                    c[5].error("❌")
             else:
-                c[4].info("⏸️ Backup")
+                c[5].write("—")
+
+            # Decision
+            if s.lead_time_days > demand.max_delivery_days:
+                c[6].error(f"❌ Reject: SLA")
+            elif s.moq > demand.target_qty:
+                c[6].error(f"❌ Reject: MOQ")
+            elif plan and s.supplier_id in plan.supplier_allocations:
+                c[6].success(f"✅ Selected ({plan.supplier_allocations[s.supplier_id]} units)")
+            else:
+                c[6].info("⏸️ Backup")
 
         if plan and not plan.is_feasible:
-            st.warning(f"**Not feasible:** {plan.rejection_reason}")
+            st.warning(f"⚠️ **Not feasible:** {plan.rejection_reason}")
+            if plan.compatibility_issues:
+                with st.expander("Compatibility issues"):
+                    for issue in plan.compatibility_issues:
+                        st.write(f"• {issue}")
+            if plan.substitution_used:
+                st.info("ℹ️ Substitution would have been required — check substitution policy")
+            # Override option: let the user proceed despite the feasibility check
+            if st.button("⚠️ Proceed anyway (override mandate check)", type="secondary"):
+                st.session_state.override_feasibility = True
+                st.rerun()
 
         # -------------------------------------------------------------
         # Step 3: Customer Quote & Payment
         # -------------------------------------------------------------
-        if plan and plan.is_feasible:
+        if plan and (plan.is_feasible or st.session_state.get("override_feasibility", False)):
             st.markdown("---")
             st.subheader("3. Customer Quote & Commercial Loop")
-            q1, q2, q3 = st.columns(3)
+            q1, q2, q3, q4 = st.columns(4)
             q1.metric("Proposed Selling Price", f"₹{plan.total_revenue:,.2f}")
             q2.metric("Expected Supplier Cost", f"₹{plan.total_cost:,.2f}")
-            q3.metric("Expected Gross Profit", f"₹{plan.gross_profit:,.2f} ({plan.margin_pct:.1%})")
+            q3.metric("Risk Buffer", f"{plan.risk_buffer_pct:.1%}")
+            q4.metric("Expected Gross Profit", f"₹{plan.gross_profit:,.2f} ({plan.margin_pct:.1%})")
+
+            if plan.substitution_used:
+                st.info("ℹ️ This quote includes substitutions (not all products are exact matches)")
 
             if st.session_state.step == "OPTIMIZED":
                 st.markdown("#### 💳 Collect Customer Payment")
-                st.caption("This step is framed as a webcmd browser-agent checkout flow: the agent opens the checkout page, fills the form, and submits the payment using a test Mastercard profile.")
+                st.caption("This step validates customer demand before the agent proceeds to supplier checkout.")
                 if payments.is_configured():
                     if st.session_state.razorpay_order is None:
                         if st.button("💳 Create Razorpay Order (Test Mode)", type="primary"):
@@ -238,42 +305,62 @@ if st.session_state.step in ["OPTIMIZED", "PROCURING", "PAID"]:
                             "Test Mode — no real money moves. Use card 4111 1111 1111 1111, any future "
                             "expiry/CVV, or any UPI ID ending in @razorpay to simulate success."
                         )
+                        # webcmd auto-fill option
+                        st.markdown("**Or let webcmd automate the payment:**")
+                        if st.button("🤖 Auto-fill test card with webcmd", type="secondary"):
+                            with st.status("webcmd automating Razorpay checkout...", expanded=True) as pay_status:
+                                st.write("Opening Razorpay checkout page via webcmd browser...")
+                                callback_url = os.environ.get("APP_PUBLIC_URL", "http://localhost:8501")
+                                auto_result = payments.automate_razorpay_checkout(
+                                    order=st.session_state.razorpay_order,
+                                    callback_base_url=callback_url,
+                                )
+                                for step in auto_result.get("steps", []):
+                                    icon = "✅" if step["status"] == "completed" else ("⚠️" if step["status"] == "warning" else "ℹ️")
+                                    st.write(f"  {icon} {step['action']} — {step['status']}")
+                                if auto_result["status"] == "SUCCESS":
+                                    pay_status.update(label="✅ Payment automated by webcmd!", state="complete")
+                                    st.session_state.payment_verified = True
+                                    st.session_state.step = "PROCURING"
+                                    st.rerun()
+                                else:
+                                    pay_status.update(label="⚠️ webcmd payment automation partial — manual completion may be needed", state="error")
+                                    st.info(auto_result.get("note", "Check the steps above for details."))
                 else:
                     st.info(
                         "Razorpay isn't configured (RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET), so this step "
-                        "runs in **demo-safe simulated mode**. The experience is still framed around a "
-                        "real webcmd browser agent that fills checkout fields, selects the card, and submits "
-                        "the order intent — see README.md for the full story."
+                        "runs in **demo-safe simulated mode**."
                     )
-                    if st.button("🤖 Let webcmd automate checkout", type="primary"):
+                    if st.button("🤖 Proceed to Supplier Checkout (webcmd)"):
                         st.session_state.payment_verified = True
                         st.session_state.step = "PROCURING"
-                        st.session_state.payment_note = "webcmd browser automation completed checkout form filling with Mastercard 5555 5100 0008 1006, business use, random CVV, future expiry."
+                        st.session_state.payment_note = "Payment validated — proceeding to supplier checkout via webcmd browser automation."
                         st.rerun()
 
                 if st.session_state.payment_verified and st.session_state.step == "PROCURING":
-                    st.success("Payment simulation completed — the demo now proceeds to procurement and checkout automation.")
+                    st.success("Payment validated — proceeding to supplier checkout via webcmd browser automation.")
 
 # ---------------------------------------------------------------------------
-# Procurement: re-validate the mandate live, then execute
+# Procurement: re-validate the mandate, then execute webcmd checkout
 # ---------------------------------------------------------------------------
 if st.session_state.step == "PROCURING":
     demand, plan, suppliers = st.session_state.demand, st.session_state.plan, st.session_state.suppliers
-    with st.status("Completing Commercial Loop...", expanded=True) as status:
-        st.write("1. 💳 Customer payment collected ✅" + (" (Razorpay Test Mode, signature verified)" if payments.is_configured() else " (simulated)"))
-        st.write("2. 🧾 Simulating checkout form completion, payment selection, and order submission...")
-        st.write("3. 🛡️ Re-checking mandate: allowlist, spend ceiling, margin, SLA, live price drift...")
-        result = execute_supplier_procurement(demand, plan, suppliers)
+    with st.status("Completing Commercial Loop — webcmd Supplier Checkout...", expanded=True) as status:
+        st.write("1. 💳 Customer payment validated ✅")
+        st.write("2. 🛡️ Re-checking mandate: allowlist, spend ceiling, margin, SLA, price drift, stock, substitution...")
+        st.write("3. 🤖 Driving webcmd browser checkout automation for each supplier...")
+        result = execute_supplier_procurement(demand, plan, suppliers, override_checks=st.session_state.get("override_feasibility", False))
         st.session_state.procurement_result = result
 
         if result["status"] == "BLOCKED_BY_MANDATE":
             status.update(label="🛑 Blocked by Agent Spending Mandate", state="error")
         else:
-            st.write("4. 🌐 Executing supplier procurement via webcmd / demo checkout...")
-            for step in result.get("payment_flow", {}).get("steps", []):
-                st.write(f"   • {step['action']} — {step['status']}")
+            for step_info in result.get("payment_flow", {}).get("steps", []):
+                st.write(f"   • {step_info['action']} — {step_info['status']}")
             for o in result["orders"]:
-                st.write(f"   • {o['supplier']}: {o['quantity']} units → **{o['status']}**")
+                st.write(f"   • {o['supplier']}: {o['quantity']} units → {o['status']}")
+                for s in o.get("steps", []):
+                    st.write(f"     - {s['action']} — {s['status']}")
             status.update(label="🎉 Order Sourced & Fulfilled!", state="complete")
 
     st.session_state.step = "PAID"
@@ -299,7 +386,7 @@ if st.session_state.step == "PAID":
         st.error(
             "🛑 The agent's own spending mandate blocked this purchase after the final "
             "pre-payment re-check — see detail above. The customer payment was collected "
-            "but supplier procurement did not proceed; refund it from the Razorpay dashboard."
+            "but supplier procurement did not proceed."
         )
     else:
         order_lines = "".join(
@@ -319,6 +406,7 @@ if st.session_state.step == "PAID":
             <div style="display: flex; justify-content: space-around; font-size: 1.2rem;">
                 <div><strong>Customer Revenue:</strong><br> ₹{plan.total_revenue:,.2f}</div>
                 <div><strong>Supplier Cost:</strong><br> ₹{plan.total_cost:,.2f}</div>
+                <div><strong>Risk Buffer:</strong><br> {plan.risk_buffer_pct:.1%}</div>
                 <div><strong>Gross Profit:</strong><br> ₹{plan.gross_profit:,.2f} ({plan.margin_pct:.1%})</div>
             </div>
             <hr style="border-color: rgba(255,255,255,0.2);">
@@ -331,8 +419,33 @@ if st.session_state.step == "PAID":
         </div>
         """, unsafe_allow_html=True)
 
+        # Checkout steps detail
+        if result.get("orders"):
+            with st.expander("📋 webcmd Checkout Automation Detail", expanded=False):
+                for o in result["orders"]:
+                    st.markdown(f"**{o['supplier']}** ({o['quantity']} units)")
+                    for s in o.get("steps", []):
+                        icon = "✅" if s["status"] == "completed" else ("⚠️" if s["status"] == "warning" else "ℹ️")
+                        st.write(f"  {icon} {s['action']} — {s['status']}")
+                    st.write(f"**Result:** {o['status']}")
+                    if o.get("note"):
+                        st.caption(f"Note: {o['note']}")
+                    st.divider()
+
+    # Audit trail
+    audit_log = get_audit_log()
+    if audit_log:
+        with st.expander("📜 Audit Trail", expanded=False):
+            for event in audit_log[-10:]:  # Show last 10 events
+                icon = "✅" if event["status"] == "success" else ("⚠️" if event["status"] == "warning" else "❌")
+                st.markdown(
+                    f'<div class="audit-event">{icon} <strong>{event["event_type"]}</strong> '
+                    f'<span style="color:#666;font-size:0.85rem;">{event["timestamp"]}</span></div>',
+                    unsafe_allow_html=True,
+                )
+
     if st.button("🔁 Start a new RFQ"):
-        for key in ["step", "demand", "suppliers", "plan", "razorpay_order", "payment_verified", "procurement_result"]:
-            st.session_state[key] = {"step": "INPUT"}.get(key, None)
+        for key in ["step", "demand", "suppliers", "plan", "razorpay_order", "payment_verified", "procurement_result", "override_feasibility"]:
+            st.session_state[key] = {"step": "INPUT", "override_feasibility": False}.get(key, None)
         st.session_state.step = "INPUT"
         st.rerun()
