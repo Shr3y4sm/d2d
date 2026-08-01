@@ -102,13 +102,22 @@ prompt = st.text_area("RFQ Prompt", value=hero_prompt_default, height=75)
 # Supplier selection widget
 st.markdown("**Select suppliers to query** (fewer = faster):")
 all_supplier_options = {s["supplier_id"]: s["name"] for s in SUPPLIER_SOURCES}
-default_suppliers = ["amazon_in", "flipkart"]
+all_supplier_options["web_discovery"] = "Open Web Discovery (webcmd search)"
+webcmd_supercharge = st.checkbox(
+    "Maximize webcmd usage: query all supported suppliers + open web discovery",
+    value=True,
+    help="This is the fullest webcmd-heavy path and the strongest demo case for the hackathon.",
+)
+if webcmd_supercharge:
+    default_suppliers = list(all_supplier_options.keys())
+else:
+    default_suppliers = ["amazon_in", "flipkart", "web_discovery"]
 selected_suppliers = st.multiselect(
     "Choose suppliers:",
     options=list(all_supplier_options.keys()),
     default=default_suppliers,
     format_func=lambda x: all_supplier_options[x],
-    help="Only selected suppliers will be queried. Amazon.in + Flipkart is fastest.",
+    help="Only selected suppliers will be queried. Amazon.in + Flipkart + web discovery is a webcmd-first flow.",
 )
 
 if st.button("🚀 Process Demand & Discover Suppliers", type="primary"):
@@ -278,67 +287,42 @@ if st.session_state.step in ["OPTIMIZED", "PROCURING", "PAID"]:
                 st.info("ℹ️ This quote includes substitutions (not all products are exact matches)")
 
             if st.session_state.step == "OPTIMIZED":
-                st.markdown("#### 💳 Collect Customer Payment")
-                st.caption("This step validates customer demand before the agent proceeds to supplier checkout.")
-                if payments.is_configured():
-                    if st.session_state.razorpay_order is None:
-                        if st.button("💳 Create Razorpay Order (Test Mode)", type="primary"):
-                            try:
-                                st.session_state.razorpay_order = payments.create_order(
-                                    amount_inr=plan.total_revenue,
-                                    receipt_id=f"d2d_{demand.product[:20].replace(' ', '_')}",
-                                    notes={"product": demand.product, "qty": str(demand.target_qty)},
-                                )
-                                st.rerun()
-                            except Exception as ex:
-                                st.error(f"Could not create Razorpay order: {ex}")
-                    else:
-                        callback_url = os.environ.get("APP_PUBLIC_URL", "http://localhost:8501")
-                        checkout_html = payments.build_checkout_html(
-                            order=st.session_state.razorpay_order,
-                            customer_name="Demand2Deal Customer",
-                            description=f"{demand.target_qty}x {demand.product}",
-                            callback_base_url=callback_url,
-                        )
-                        st.html(checkout_html, unsafe_allow_javascript=True)
-                        st.caption(
-                            "Test Mode — no real money moves. Use card 4111 1111 1111 1111, any future "
-                            "expiry/CVV, or any UPI ID ending in @razorpay to simulate success."
-                        )
-                        # webcmd auto-fill option
-                        st.markdown("**Or let webcmd automate the payment:**")
-                        if st.button("🤖 Auto-fill test card with webcmd", type="secondary"):
-                            with st.status("webcmd automating Razorpay checkout...", expanded=True) as pay_status:
-                                st.write("Opening Razorpay checkout page via webcmd browser...")
-                                callback_url = os.environ.get("APP_PUBLIC_URL", "http://localhost:8501")
-                                auto_result = payments.automate_razorpay_checkout(
-                                    order=st.session_state.razorpay_order,
-                                    callback_base_url=callback_url,
-                                )
-                                for step in auto_result.get("steps", []):
-                                    icon = "✅" if step["status"] == "completed" else ("⚠️" if step["status"] == "warning" else "ℹ️")
-                                    st.write(f"  {icon} {step['action']} — {step['status']}")
-                                if auto_result["status"] == "SUCCESS":
-                                    pay_status.update(label="✅ Payment automated by webcmd!", state="complete")
-                                    st.session_state.payment_verified = True
-                                    st.session_state.step = "PROCURING"
-                                    st.rerun()
-                                else:
-                                    pay_status.update(label="⚠️ webcmd payment automation partial — manual completion may be needed", state="error")
-                                    st.info(auto_result.get("note", "Check the steps above for details."))
-                else:
-                    st.info(
-                        "Razorpay isn't configured (RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET), so this step "
-                        "runs in **demo-safe simulated mode**."
-                    )
-                    if st.button("🤖 Proceed to Supplier Checkout (webcmd)"):
-                        st.session_state.payment_verified = True
-                        st.session_state.step = "PROCURING"
-                        st.session_state.payment_note = "Payment validated — proceeding to supplier checkout via webcmd browser automation."
-                        st.rerun()
+                if st.session_state.get("simulated_payment") is None:
+                    st.session_state.simulated_payment = engine.simulate_payment_flow(demand, plan)
 
-                if st.session_state.payment_verified and st.session_state.step == "PROCURING":
-                    st.success("Payment validated — proceeding to supplier checkout via webcmd browser automation.")
+                payment = st.session_state.simulated_payment
+                invoice = payment["invoice"]
+
+                st.markdown("#### 💳 Simulated Customer Invoice & Payment")
+                st.caption("This hackathon demo uses a complete simulated invoice flow for customer payment authorization.")
+
+                inv_cols = st.columns([2, 2, 2, 2])
+                inv_cols[0].markdown(f"**Invoice #** {invoice['invoice_number']}")
+                inv_cols[1].markdown(f"**Date**\n{invoice['date']}")
+                inv_cols[2].markdown(f"**Status**\n{invoice['status']}")
+                inv_cols[3].markdown(f"**Total**\n₹{invoice['total_amount']:,.2f}")
+
+                st.markdown("**Billed to:**")
+                st.write(f"{invoice['billed_to']['name']} — {invoice['billed_to']['location']}")
+                st.markdown("**Sold by:**")
+                st.write(f"{invoice['sold_by']['name']} — {invoice['sold_by']['contact']}")
+
+                item_rows = [
+                    {"Description": item["description"], "Qty": item["quantity"], "Unit Price": f"₹{item['unit_price']:,.2f}", "Total": f"₹{item['total']:,.2f}"}
+                    for item in invoice["items"]
+                ]
+                st.table(item_rows)
+                st.caption("This is a demo invoice for a simulated customer payment authorization; no actual funds are transferred.")
+
+                if st.button("✅ Simulate Customer Payment and proceed to supplier checkout", type="primary"):
+                    st.session_state.payment_verified = True
+                    st.session_state.step = "PROCURING"
+                    st.session_state.payment_note = f"Simulated invoice {invoice['invoice_number']} paid."
+                    st.session_state.payment_flow = payment
+                    st.rerun()
+
+            if st.session_state.payment_verified and st.session_state.step == "PROCURING":
+                st.success("Simulated customer payment captured — proceeding to supplier checkout via webcmd browser automation.")
 
 # ---------------------------------------------------------------------------
 # Procurement: re-validate the mandate, then execute webcmd checkout

@@ -979,8 +979,8 @@ def fetch_all_live_suppliers(demand: CustomerDemand, selected_supplier_ids: Opti
                 quotes.append(quote)
                 seen_urls.add(quote.product_url)
 
-    # 2. Web-wide discovery (only if no selected suppliers or user wants it)
-    if not selected_supplier_ids or "web_discovery" in (selected_supplier_ids or []):
+    # 2. Web-wide discovery (default if user selected it or if the supplier set is small)
+    if "web_discovery" in (selected_supplier_ids or []) or not selected_supplier_ids or len(selected_supplier_ids) < 5:
         web_discovered = _discover_suppliers_via_web(demand)
         for wq in web_discovered:
             if wq.product_url not in seen_urls:
@@ -1616,15 +1616,41 @@ def _execute_webcmd_checkout(
 
 
 def simulate_payment_flow(demand: CustomerDemand, plan: AllocationPlan) -> Dict:
-    """Create a deterministic checkout transcript for the demo flow."""
+    """Create a deterministic invoice-based demo payment flow."""
+    invoice_number = f"SIM-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+    unit_price = round(plan.total_revenue / demand.target_qty, 2) if demand.target_qty else 0.0
+    invoice = {
+        "invoice_number": invoice_number,
+        "date": datetime.utcnow().strftime("%Y-%m-%d"),
+        "billed_to": {
+            "name": "Demand2Deal Customer",
+            "location": demand.location,
+        },
+        "sold_by": {
+            "name": "Demand2Deal Autonomous Distributor",
+            "contact": "operations@demand2deal.com",
+        },
+        "items": [
+            {
+                "description": f"{demand.target_qty} x {demand.product}",
+                "quantity": demand.target_qty,
+                "unit_price": unit_price,
+                "total": round(plan.total_revenue, 2),
+            }
+        ],
+        "total_amount": round(plan.total_revenue, 2),
+        "status": "Simulated Paid",
+        "notes": "Demo invoice for a simulated customer payment flow; no funds are transferred.",
+    }
     return {
         "completed": True,
-        "payment_method": "simulated test card",
+        "payment_method": "simulated invoice authorization",
+        "invoice": invoice,
         "steps": [
-            {"action": "Opened checkout form and autofilled customer details, shipping address, and business-use billing note", "status": "completed"},
-            {"action": "Auto-filled test card 5555 5100 0008 1006 as Mastercard, business use, with a random CVV and a future expiry date", "status": "completed"},
-            {"action": f"Confirmed order summary for {demand.target_qty} x {demand.product}", "status": "completed"},
-            {"action": f"Submitted checkout and recorded order intent for ₹{plan.total_revenue:,.2f}", "status": "completed"},
+            {"action": f"Generated demo invoice {invoice_number} for {demand.target_qty} x {demand.product}", "status": "completed"},
+            {"action": "Authorized simulated customer payment in sandbox mode", "status": "completed"},
+            {"action": "Recorded payment receipt and locked the customer revenue for supplier procurement", "status": "completed"},
+            {"action": f"Ready to proceed to supplier checkout for ₹{plan.total_revenue:,.2f}", "status": "completed"},
         ],
     }
 
