@@ -2,9 +2,9 @@
 
 Agentic B2B commerce for the **webcmd Hackathon — Agentic Payments Edition**: a
 customer RFQ comes in, an AI agent sources live supplier quotes across the open
-web, optimizes the supply chain against a spending mandate, collects a real
-Razorpay Test Mode payment, re-validates the mandate, and drives the supplier-side
-procurement via webcmd browser automation — all with **zero starting inventory**.
+web, presents them for the user to select, then the agent prepares the supplier
+cart via webcmd browser automation, and the user verifies and completes the payment
+via Razorpay Test Mode — all with **zero starting inventory**.
 
 > Commerce without inventory.
 
@@ -56,10 +56,10 @@ Demand2Deal reframes agentic payments from *"help me shop"* to
 Customer Demand (RFQ)
   → 1. Requirement parser (Gemini or regex)
   → 2. Supplier adapters & web-wide discovery (webcmd)
-  → 3. Commercial optimizer (MOQ, SLA, margin, risk buffer)
-  → 4. Customer quote + Razorpay Test Mode payment
-  → 5. Spend-policy gate (re-validate everything live)
-  → 6. Supplier checkout via webcmd browser automation
+  → 3. USER selects a supplier from the results
+  → 4. Agent prepares supplier cart (webcmd: add-to-cart, fill details)
+  → 5. Spend-mandate check (allowlist, margin, ceiling, SLA, stock)
+  → 6. USER verifies & pays (Razorpay Test Mode)
   → 7. Audit & margin report
 ```
 
@@ -135,11 +135,12 @@ agent-driven procurement flow needs.
 The system is implemented across four modules:
 
 - **`app.py`** — Streamlit UI and state machine. Walks the user through the
-  five-stage commercial loop (input → discover → optimize → pay → procure) and
+  flow: input RFQ → discover suppliers → user selects supplier → agent prepares
+  cart via webcmd → user verifies & pays (Razorpay) → money shot. It also
   renders the "money shot" transaction summary.
 - **`engine.py`** — The agent backend: RFQ parsing, supplier sourcing (adapters
-  + web-wide discovery), the commercial optimizer, the pre-payment mandate
-  re-check, and the webcmd-driven checkout automation.
+  + web-wide discovery), single-supplier quote calculation, spend-mandate gate,
+  and webcmd-driven checkout automation (add-to-cart, form-fill, confirmation).
 - **`payments.py`** — Real Razorpay Test Mode integration: order creation
   (server-side), Checkout.js modal (browser, public key only), and HMAC-SHA256
   signature verification (server-side). Degrades to a clearly-labeled
@@ -155,20 +156,20 @@ The system is implemented across four modules:
 ```
 User RFQ ──→ parse_rfq_with_gemini() ──→ CustomerDemand
                                              │
-                  fetch_all_live_suppliers() │
+                  fetch_all_live_suppliers() │  ← webcmd adapters + browser
                   ├── _fetch_via_adapter()   │  (Amazon.in: amazon-in adapter)
                   ├── _fetch_via_generic_browser()  (other sites: browser + Gemini)
                   └── _discover_suppliers_via_web()  (DuckDuckGo web-wide)
                                              │
-                  optimize_supply_chain() ──→ AllocationPlan
+                  USER selects supplier from list  ← human-in-the-loop
                                              │
-                  Razorpay Test Mode payment (payments.py)
+                  prepare_supplier_cart() ← webcmd checkout (add-to-cart, fill)
                                              │
-                  execute_supplier_procurement()
-                  ├── revalidate_mandate_before_purchase()  ← pre-payment gate
-                  └── _execute_webcmd_checkout()            ← agent checkout
+                  calculate_supplier_quote() + check_supplier_mandate()  ← linked
                                              │
-                  Money Shot: revenue − cost = gross profit
+                  USER verifies & pays (Razorpay Test Mode, linked to supplier)
+                                             │
+                  Money Shot: revenue − supplier cost = gross profit
 ```
 
 ### Optimized JSON schema
@@ -211,9 +212,11 @@ All supplier data is normalized into a single `SupplierQuote` object:
 |---|---|---|
 | 0:00–0:20 | Problem | "Small distributors lose business daily because customers ask for items they don't stock." |
 | 0:20–0:35 | Proposition | "What if an SME could sell products it has never stocked?" |
-| 0:35–1:30 | Agent acts | Enter the RFQ. Show supplier queries, normalized results, and rejection of the cheapest option because it misses the delivery SLA. |
-| 1:30–2:00 | Customer transaction | Complete quote with preserved margin. Customer clicks Pay. Razorpay Test Mode returns success. |
-| 2:00–2:40 | Agent spends | Re-checks the mandate, opens supplier checkout via webcmd, places the order, captures confirmation. |
+| 0:35–1:00 | Agent discovers | Enter the RFQ. Show supplier queries, normalized results table. |
+| 1:00–1:20 | User selects | User picks a supplier from the table (e.g. Amazon.in vs Flipkart). |
+| 1:20–2:00 | Agent prepares cart | webcmd opens the supplier product page, adds to cart, fills shipping/billing details, captures confirmation. |
+| 2:00–2:30 | User pays | Show the supplier-linked quote. User verifies and clicks Pay. Razorpay Test Mode returns success. |
+| 2:30–3:00 | Money shot | SALE COMPLETE: customer revenue, supplier cost, gross profit, zero starting inventory, order confirmation. |
 | 2:40–3:00 | Money shot | SALE COMPLETE: customer revenue, supplier cost, gross profit, zero starting inventory, supplier order confirmation. |
 
 ### Default demo prompt
@@ -238,21 +241,20 @@ broadly — but payment execution is constrained by explicit commercial policy.
 | Max delivery | 3 days |
 | Substitution policy | require_approval |
 
-### Final pre-payment checks (re-validated live)
+### Pre-payment check (static, before user pays)
 
-Before the agent places any supplier order, `revalidate_mandate_before_purchase()`
-re-checks:
+Before the user is asked to pay, `check_supplier_mandate()` verifies (against
+the already-displayed quote — no live re-fetch, so it's instant):
 
-1. ✅ **Merchant allowlist** — every allocated supplier is on the approved list
-2. ✅ **Spend ceiling** — total supplier cost ≤ ceiling
-3. ✅ **Minimum gross margin** — margin minus risk buffer ≥ floor
-4. ✅ **Delivery SLA** — planned lead time ≤ required days
-5. ✅ **Price drift** — live re-fetch confirms price hasn't moved >2%
-6. ✅ **Stock availability** — live re-fetch confirms stock still meets the order
-7. ✅ **Substitution policy** — any substitution is explicitly permitted
+1. ✅ **Merchant allowlist** — the selected supplier is on the approved list
+2. ✅ **Spend ceiling** — supplier cost ≤ ₹250,000
+3. ✅ **Minimum gross margin** — margin minus 2% risk buffer ≥ 8% floor
+4. ✅ **Delivery SLA** — supplier lead time ≤ required days
+5. ✅ **Stock availability** — supplier stock ≥ order quantity
+6. ✅ **Substitution policy** — compatibility noted, substitutions flagged
 
-If any check fails, the purchase is **blocked** and the customer payment is
-refunded/held — the agent never spends without a valid mandate.
+If any check fails, the Pay button is hidden behind an explicit user override
+so the agent never spends without a valid mandate.
 
 ### ⚠️ A real contradiction in the proposal (worth knowing)
 
