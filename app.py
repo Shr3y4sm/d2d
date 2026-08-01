@@ -338,22 +338,37 @@ if st.session_state.step == "PROCURING":
 
         if result["status"] == "BLOCKED_BY_MANDATE":
             status.update(label="🛑 Blocked by Agent Spending Mandate", state="error")
+            st.session_state.step = "FAILED"
+        elif result["status"] == "FAILED":
+            for step_info in result.get("payment_flow", {}).get("steps", []):
+                st.write(f"   • {step_info['action']} — {step_info['status']}")
+            for o in result["orders"]:
+                note_suffix = f" — {o['note']}" if o.get("note") else ""
+                st.write(f"   • {o['supplier']}: {o['quantity']} units → {o['status']}{note_suffix}")
+                for s in o.get("steps", []):
+                    st.write(f"     - {s['action']} — {s['status']}")
+            status.update(label="❌ Supplier checkout failed", state="error")
+            st.session_state.step = "FAILED"
         else:
             for step_info in result.get("payment_flow", {}).get("steps", []):
                 st.write(f"   • {step_info['action']} — {step_info['status']}")
             for o in result["orders"]:
-                st.write(f"   • {o['supplier']}: {o['quantity']} units → {o['status']}")
+                note_suffix = f" — {o['note']}" if o.get("note") else ""
+                st.write(f"   • {o['supplier']}: {o['quantity']} units → {o['status']}{note_suffix}")
                 for s in o.get("steps", []):
                     st.write(f"     - {s['action']} — {s['status']}")
-            status.update(label="🎉 Order Sourced & Fulfilled!", state="complete")
+            if any(o.get("note") and "payment page" in o.get("note", "").lower() for o in result.get("orders", [])):
+                status.update(label="🎉 Supplier checkout reached payment page — final payment step pending", state="complete")
+            else:
+                status.update(label="🎉 Order Sourced & Fulfilled!", state="complete")
+            st.session_state.step = "PAID"
 
-    st.session_state.step = "PAID"
     st.rerun()
 
 # ---------------------------------------------------------------------------
 # Step 4: Result — mandate outcome + (if passed) the Money Shot
 # ---------------------------------------------------------------------------
-if st.session_state.step == "PAID":
+if st.session_state.step in ["PAID", "FAILED"]:
     plan = st.session_state.plan
     result = st.session_state.procurement_result or {}
     if plan is None:
@@ -375,7 +390,8 @@ if st.session_state.step == "PAID":
     else:
         order_lines = "".join(
             f'<div style="margin-top:6px;font-size:0.95rem;">• {o["supplier"]}: {o["quantity"]} units — '
-            f'<strong>{o["status"].replace("_"," ")}</strong></div>'
+            f'<strong>{o["status"].replace("_"," ")}</strong>'
+                + (f' — {o["note"]}' if o.get("note") else "")
             for o in result.get("orders", [])
         )
         badge = (

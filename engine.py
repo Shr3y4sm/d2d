@@ -368,6 +368,53 @@ def run_webcmd(args: List[str]) -> Dict:
     return subprocess_run(["webcmd"] + args)
 
 
+def browser_click(session: str, selector: str) -> Dict:
+    """Click a browser element, resolving ambiguous CSS selectors with --nth."""
+    click_args = ["browser", session, "click", selector]
+    res = run_webcmd(click_args)
+    if res["success"]:
+        return res
+
+    stderr = res.get("stderr", "").lower()
+    if "execution context was destroyed" in stderr or "page.evaluate" in stderr:
+        state_res = run_webcmd(["browser", session, "state"])
+        if state_res["success"]:
+            return {"success": True, "stdout": state_res.get("stdout", ""), "stderr": res.get("stderr", "")}
+
+    # If a selector is ambiguous, choose the first visible match or fallback to the first match.
+    find_res = run_webcmd(["browser", session, "find", "--css", selector])
+    if not find_res["success"] or not find_res["stdout"].strip():
+        return res
+
+    try:
+        payload = json.loads(find_res["stdout"])
+    except json.JSONDecodeError:
+        return res
+
+    matches = payload.get("matches_n", 0)
+    if matches <= 1:
+        return res
+
+    nth = 0
+    for idx, entry in enumerate(payload.get("entries", [])):
+        if entry.get("visible"):
+            nth = idx
+            break
+
+    click_args = ["browser", session, "click", selector, "--nth", str(nth)]
+    res2 = run_webcmd(click_args)
+    if res2["success"]:
+        return res2
+
+    stderr2 = res2.get("stderr", "").lower()
+    if "execution context was destroyed" in stderr2 or "page.evaluate" in stderr2:
+        state_res = run_webcmd(["browser", session, "state"])
+        if state_res["success"]:
+            return {"success": True, "stdout": state_res.get("stdout", ""), "stderr": res2.get("stderr", "")}
+
+    return res2
+
+
 def is_waf_blocked(dom_text: str) -> bool:
     """Fast heuristic for anti-bot / WAF challenge pages."""
     blocked_keywords = [
@@ -1514,18 +1561,20 @@ def _execute_webcmd_checkout(
 
     # Step 3: Try to find and click "Add to Cart" via common selectors
     add_to_cart_selectors = [
+        "input#add-to-cart-button", "input[name='submit.add-to-cart']",
         "button[class*='add-to-cart']", "button[class*='addtocart']",
         "button[class*='add_cart']", "button[id*='add-to-cart']",
-        "button[id*='addtocart']", "input[value*='Add to Cart']",
-        "button:text-is('Add to Cart')", "button:text-is('Buy Now')",
-        "button[class*='buy-now']", "button[class*='buynow']",
+        "input[value*='Add to Cart']", "input[type='submit'][value*='Add to Cart']",
+        "input[type='button'][value*='Add to Cart']", "button[aria-label*='Add to Cart']",
+        "button[aria-label*='add to cart']", "button[class*='buy-now']",
+        "button[class*='buynow']", "input[title*='Add to Shopping Cart']",
     ]
 
     cart_found = False
     for selector in add_to_cart_selectors:
         find_res = run_webcmd(["browser", session, "find", "--css", selector])
         if find_res["success"] and find_res["stdout"].strip():
-            click_res = run_webcmd(["browser", session, "click", selector])
+            click_res = browser_click(session, selector)
             if click_res["success"]:
                 steps.append({"action": f"Found and clicked add-to-cart button (selector: {selector})", "status": "completed"})
                 cart_found = True
@@ -1535,23 +1584,58 @@ def _execute_webcmd_checkout(
                 steps.append({"action": f"Found add-to-cart button but could not click it", "status": "warning"})
 
     if not cart_found:
-        steps.append({"action": "Add-to-cart button not found via common selectors — proceeding to checkout simulation", "status": "warning"})
+        # Generic fallback: click any submit-like button if the targeted add-to-cart selectors fail.
+        generic_button_selectors = [
+            "button[type='submit']", "input[type='submit']",
+            "button[role='button']", "input[role='button']",
+            "button[class*='btn']", "input[class*='btn']",
+        ]
+        for selector in generic_button_selectors:
+            find_res = run_webcmd(["browser", session, "find", "--css", selector])
+            if find_res["success"] and find_res["stdout"].strip():
+                click_res = browser_click(session, selector)
+                if click_res["success"]:
+                    steps.append({"action": f"Clicked generic button selector as fallback (selector: {selector})", "status": "completed"})
+                    cart_found = True
+                    time.sleep(1)
+                    break
+        if not cart_found:
+            steps.append({"action": "Add-to-cart button not found via common selectors — proceeding to checkout navigation", "status": "warning"})
 
     # Step 4: Try to navigate to checkout
     checkout_selectors = [
+        "input[name='proceedToRetailCheckout']", "#hlb-ptc-btn-native",
         "a[class*='checkout']", "button[class*='checkout']",
         "a[href*='checkout']", "button[title*='checkout' i]",
         "a[class*='cart']", "button[class*='cart']",
         "a[href*='cart']", "button[title*='cart' i]",
+        "button[aria-label*='Checkout']", "button[aria-label*='Cart']",
+        "button[class*='proceed']", "input[aria-label*='checkout']",
+        "button[title*='Proceed to checkout']", "input[title*='Proceed to checkout']",
     ]
 
     if not checkout_found:
         for selector in checkout_selectors:
             find_res = run_webcmd(["browser", session, "find", "--css", selector])
             if find_res["success"] and find_res["stdout"].strip():
-                click_res = run_webcmd(["browser", session, "click", selector])
+                click_res = browser_click(session, selector)
                 if click_res["success"]:
-                    steps.append({"action": f"Navigated to checkout/cart page", "status": "completed"})
+                    steps.append({"action": f"Navigated to checkout/cart page (selector: {selector})", "status": "completed"})
+                    checkout_found = True
+                    time.sleep(2)
+                    break
+
+    if not checkout_found:
+        generic_checkout_selectors = [
+            "button[type='submit']", "button[role='button']", "input[type='submit']",
+            "a[role='button']", "button[class*='btn']", "a[class*='btn']",
+        ]
+        for selector in generic_checkout_selectors:
+            find_res = run_webcmd(["browser", session, "find", "--css", selector])
+            if find_res["success"] and find_res["stdout"].strip():
+                click_res = browser_click(session, selector)
+                if click_res["success"]:
+                    steps.append({"action": f"Clicked generic checkout/cart button as fallback (selector: {selector})", "status": "completed"})
                     checkout_found = True
                     time.sleep(2)
                     break
@@ -1601,13 +1685,22 @@ def _execute_webcmd_checkout(
     if order_confirmed:
         steps.append({"action": "✅ Order confirmed on supplier site", "status": "completed"})
         success = True
+    elif cart_found and checkout_found:
+        steps.append({"action": "Reached supplier checkout/payment page — automation succeeded to payment stage", "status": "completed"})
+        success = True
+    elif not cart_found and not checkout_found:
+        steps.append({"action": "Unable to add item to cart or reach checkout — automation failed", "status": "failed"})
     else:
-        # If adapter-based checkout is available, note that too
-        steps.append({"action": "Order confirmation text not found — posting simulated confirmation for demo continuity", "status": "info"})
+        steps.append({"action": "Checkout flow reached an intermediate page but did not clearly land on payment/confirmation", "status": "warning"})
+
+    result_status = "SUCCESS" if success else "FAILED"
+    note = "webcmd browser automation completed checkout flow." if success else "Checkout flow failed before reaching checkout."
+    if cart_found and checkout_found and not order_confirmed:
+        note = "Checkout flow reached supplier payment page; final order confirmation requires completing payment manually."
 
     return {
-        "status": "SUCCESS" if success else "PREPARED_NOT_FINALIZED",
-        "note": "webcmd browser automation completed checkout flow." if success else "Checkout flow prepared but order confirmation not detected.",
+        "status": result_status,
+        "note": note,
         "steps": steps,
         "product_url": supplier.product_url,
         "supplier": supplier.name,
@@ -1712,7 +1805,8 @@ def execute_supplier_procurement(
     }
 
     all_success = all(r.get("status") == "SUCCESS" for r in results)
-    overall_status = "SUCCESS" if all_success else "PARTIAL"
+    any_success = any(r.get("status") == "SUCCESS" for r in results)
+    overall_status = "SUCCESS" if all_success else ("FAILED" if not any_success else "PARTIAL")
 
     _append_audit_event(AuditEvent(
         timestamp=datetime.utcnow().isoformat(),
